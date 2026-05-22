@@ -127,7 +127,7 @@ def detect_with_gemini(image_bgr: np.ndarray) -> list[BBox]:
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,
-                max_output_tokens=32768,
+                max_output_tokens=8192,
             ),
         )
 
@@ -141,28 +141,39 @@ def detect_with_gemini(image_bgr: np.ndarray) -> list[BBox]:
             break
         except (genai_errors.ClientError, genai_errors.ServerError) as e:
             msg = str(e)
+            short = msg[:140].replace("\n", " ")
             if "404" in msg or "NOT_FOUND" in msg:
+                print(f"  {model_name}: not available, skipping", flush=True)
                 _EXHAUSTED.add(model_name)
                 continue
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                 m = re.search(r"retry in (\d+)", msg)
                 wait = int(m.group(1)) + 1 if m else 0
                 if wait and wait <= 10:
+                    print(f"  {model_name}: rate-limited, waiting {wait}s…", flush=True)
                     time.sleep(wait)
                     try:
                         response = _call(model_name)
                         break
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        print(f"  {model_name}: still failing ({str(e2)[:80]})", flush=True)
+                print(f"  {model_name}: quota exhausted", flush=True)
                 _EXHAUSTED.add(model_name)
                 continue
             if "503" in msg or "UNAVAILABLE" in msg:
+                print(f"  {model_name}: overloaded, waiting 8s…", flush=True)
                 time.sleep(8)
                 try:
                     response = _call(model_name)
                     break
-                except Exception:
+                except Exception as e2:
+                    print(f"  {model_name}: still overloaded ({str(e2)[:80]})", flush=True)
                     continue
+            print(f"  {model_name}: error → {short}", flush=True)
+            continue
+        except Exception as e:
+            # Catch genai SDK-level errors too (e.g. config validation)
+            print(f"  {model_name}: unexpected → {str(e)[:140]}", flush=True)
             continue
 
     if response is None:
@@ -193,27 +204,58 @@ _PADDLE = None
 
 
 def _paddle():
-    """Lazy singleton — PaddleOCR is slow to import."""
+    """Lazy singleton — PaddleOCR is slow to import. Compatible with both
+    PaddleOCR 2.x (use_angle_cls) and 3.x (different ctor)."""
     global _PADDLE
     if _PADDLE is None:
+        import logging
+        logging.getLogger("ppocr").setLevel(logging.ERROR)
         from paddleocr import PaddleOCR
-        # use_angle_cls handles rotated text. lang='ru' covers Cyrillic + Latin.
-        _PADDLE = PaddleOCR(use_angle_cls=True, lang="ru", show_log=False)
+        try:
+            # 2.x API
+            _PADDLE = PaddleOCR(use_angle_cls=True, lang="ru")
+        except (TypeError, ValueError):
+            # 3.x API — different params
+            _PADDLE = PaddleOCR(lang="ru")
     return _PADDLE
+
+
+def _paddle_ocr_call(ocr, image_rgb):
+    """Wrap the OCR call to handle both 2.x (.ocr) and 3.x (.predict) APIs."""
+    # 2.x returns: [[ [poly], (text, conf) ], …]
+    # 3.x returns: list of dict with 'rec_polys', 'rec_texts', 'rec_scores'
+    if hasattr(ocr, "predict"):
+        try:
+            res = ocr.predict(image_rgb)
+        except Exception:
+            res = None
+        if res:
+            out = []
+            for page in res:
+                polys = page.get("rec_polys") or page.get("dt_polys") or []
+                scores = page.get("rec_scores") or [1.0] * len(polys)
+                for poly, score in zip(polys, scores):
+                    out.append((poly, score))
+            return ("v3", out)
+    # 2.x
+    res = ocr.ocr(image_rgb, cls=True)
+    if not res or not res[0]:
+        return ("v2", [])
+    return ("v2", res[0])
 
 
 def detect_with_paddle(image_bgr: np.ndarray, min_conf: float = 0.5) -> list[BBox]:
     """Fallback detector. Signatures usually fail OCR or come back with very low
     confidence — we filter those out, leaving them on the page."""
     ocr = _paddle()
-    # PaddleOCR expects RGB
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    result = ocr.ocr(image_rgb, cls=True)
-    if not result or not result[0]:
-        return []
+    api_ver, lines = _paddle_ocr_call(ocr, image_rgb)
     boxes: list[BBox] = []
-    for line in result[0]:
-        poly, (_text, conf) = line[0], line[1]
+    for entry in lines:
+        if api_ver == "v3":
+            poly, conf = entry
+        else:
+            poly, (_text, conf) = entry[0], entry[1]
         if conf < min_conf:
             continue
         xs = [p[0] for p in poly]
