@@ -27,23 +27,11 @@ BBox = tuple[int, int, int, int]
 
 # ---------- Gemini path ----------
 
-GEMINI_PROMPT = """You are analysing a scanned document. Return a JSON array.
+GEMINI_PROMPT = """Analyse this scanned document. Return ONLY a JSON array of objects, each with EXACTLY two keys:
+  "type": one of "printed_text" | "handwritten_text" | "signature" | "stamp"
+  "box_2d": [ymin, xmin, ymax, xmax] in 0–1000 normalised space
 
-For EVERY visible text/visual element, return one object with:
-  - "type": one of:
-      * "printed_text"      — typed/printed text (will be ERASED)
-      * "handwritten_text"  — handwritten letters/numbers that carry information (will be ERASED)
-      * "signature"         — a handwritten personal signature / autograph (KEPT)
-      * "stamp"             — a rubber/wet stamp, seal, hologram, QR security element (KEPT)
-  - "box_2d": [ymin, xmin, ymax, xmax] in Gemini's standard 0–1000 normalised space.
-
-Rules:
-  1. Do NOT include decorative background (watermarks, security patterns, page borders).
-  2. Group text into logical blocks (a paragraph = one entry, not one entry per line).
-  3. Text near a stamp (e.g. notary line above the seal) is printed_text — give it its OWN box, separate from the stamp box.
-  4. Make boxes GENEROUS — extend 5% past the visible text on each side.
-  5. Return ONLY a valid JSON array. No markdown, no commentary.
-"""
+Group text into LARGE logical blocks (a full paragraph = ONE object, not one per line). Aim for at most ~60 objects total. Skip decorative watermarks/borders. Make boxes generous (5% padding). NO other keys, NO markdown, NO commentary — just the JSON array."""
 
 GEMINI_MODEL_CASCADE = [
     "gemini-2.0-flash",        # highest free-tier quota
@@ -90,6 +78,40 @@ def _denormalize(boxes_0_1000: list[list[int]], width: int, height: int) -> list
     return out
 
 
+def _try_parse_json_array(raw: str) -> list:
+    """Robust JSON-array parsing.
+
+    Gemini occasionally returns truncated or near-malformed JSON when the
+    response is very long (we've seen 100+ KB replies cut off mid-object).
+    Strategy:
+      1. Strip ``` fences.
+      2. Try a clean parse.
+      3. If that fails, truncate to the last complete `}` before the error
+         and try again with a closing `]`.
+    """
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```", 2)[1] if "```" in raw else raw
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError as e:
+        last_close = raw[:e.pos].rfind("}")
+        if last_close == -1:
+            return []
+        candidate = raw[: last_close + 1].rstrip(", \n\t") + "]"
+        try:
+            data = json.loads(candidate)
+            print(f"  Gemini JSON truncated; recovered {len(data) if isinstance(data, list) else 0} elements", flush=True)
+            return data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            return []
+
+
 def detect_with_gemini(image_bgr: np.ndarray) -> list[BBox]:
     """Detect text regions via Gemini, return only printed/handwritten text boxes."""
     from google.genai import errors as genai_errors
@@ -105,6 +127,7 @@ def detect_with_gemini(image_bgr: np.ndarray) -> list[BBox]:
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,
+                max_output_tokens=32768,
             ),
         )
 
@@ -145,18 +168,9 @@ def detect_with_gemini(image_bgr: np.ndarray) -> list[BBox]:
     if response is None:
         raise RuntimeError("All Gemini models exhausted")
 
-    raw = response.text.strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        data = json.loads(raw.strip())
-
-    if not isinstance(data, list):
-        raise RuntimeError(f"Expected JSON array, got {type(data).__name__}")
+    data = _try_parse_json_array(response.text)
+    if not data:
+        raise RuntimeError("Gemini returned unparseable JSON")
 
     # Filter: keep ONLY printed_text and handwritten_text — those are erased.
     # Signatures and stamps are dropped here, so they stay untouched on the page.
