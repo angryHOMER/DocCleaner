@@ -1,7 +1,14 @@
-"""Erase text from a page using LaMa inpainting.
+"""Erase text from a page using LaMa inpainting (via simple-lama-inpainting).
 
-Build a pixel-level mask from text bounding boxes (so we don't paint over
-clean background unnecessarily) and feed it to LaMa via iopaint.
+Why simple-lama-inpainting instead of iopaint:
+- iopaint bundles diffusers + transformers + an old huggingface_hub. On Colab
+  (which ships modern HF stacks) this causes import explosions.
+- simple-lama-inpainting is a thin PyPI wrapper around LaMa: torch + the
+  pretrained weights, nothing else.
+
+We still build a pixel-level mask from text bboxes (instead of masking the
+whole rectangle) so LaMa only fills the actual letter strokes — that preserves
+the document's background texture and watermarks far better.
 """
 from __future__ import annotations
 
@@ -10,13 +17,14 @@ import warnings
 
 import cv2
 import numpy as np
+from PIL import Image
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 BBox = tuple[int, int, int, int]
 
-_MODEL = None
+_LAMA = None
 _DEVICE: str | None = None
 
 _MAX_DIM_CPU = 1800   # 8 GB RAM-safe ceiling
@@ -40,15 +48,15 @@ def _detect_device() -> str:
     return _DEVICE
 
 
-def _lama_model():
-    global _MODEL
-    if _MODEL is None:
-        from iopaint.model_manager import ModelManager
+def _lama():
+    global _LAMA
+    if _LAMA is None:
+        from simple_lama_inpainting import SimpleLama
         device = _detect_device()
-        print(f"  loading LaMa on {device.upper()} (first call may download ~200 MB)…", flush=True)
-        _MODEL = ModelManager(name="lama", device=device)
+        print(f"  loading LaMa on {device.upper()} (first call downloads ~200 MB)…", flush=True)
+        _LAMA = SimpleLama(device=device)
         print(f"  LaMa ready on {device}", flush=True)
-    return _MODEL
+    return _LAMA
 
 
 def build_mask(image_bgr: np.ndarray, text_boxes: list[BBox],
@@ -93,9 +101,6 @@ def lama_inpaint(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     if cv2.countNonZero(mask) == 0:
         return image_bgr
 
-    from iopaint.schema import HDStrategy, InpaintRequest
-
-    model = _lama_model()
     device = _detect_device()
     max_dim = _MAX_DIM_GPU if device in ("cuda", "mps") else _MAX_DIM_CPU
     orig_h, orig_w = image_bgr.shape[:2]
@@ -109,22 +114,17 @@ def lama_inpaint(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     else:
         small_img, small_mask = image_bgr, mask
 
-    request = InpaintRequest(
-        hd_strategy=HDStrategy.CROP,
-        hd_strategy_crop_trigger_size=512,
-        hd_strategy_crop_margin=128 if device in ("cuda", "mps") else 64,
-        hd_strategy_resize_limit=max_dim,
-        ldm_steps=20 if device in ("cuda", "mps") else 15,
-        ldm_sampler="plms",
-        zits_wireframe=True,
-    )
+    # simple_lama_inpainting wants PIL.Image (RGB) + PIL mask (L)
+    img_rgb = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    pil_mask = Image.fromarray((small_mask > 0).astype(np.uint8) * 255, mode="L")
 
-    image_rgb = cv2.cvtColor(small_img, cv2.COLOR_BGR2RGB)
-    binary_mask = (small_mask > 0).astype(np.uint8) * 255
-    result_rgb = model(image_rgb, binary_mask, request)
-    result_bgr_small = cv2.cvtColor(result_rgb.astype(np.uint8), cv2.COLOR_RGB2BGR)
+    lama = _lama()
+    result_rgb = lama(pil_img, pil_mask)             # returns PIL.Image (RGB)
+    result_arr = np.array(result_rgb)
+    result_bgr_small = cv2.cvtColor(result_arr, cv2.COLOR_RGB2BGR)
 
-    del image_rgb, result_rgb
+    del img_rgb, pil_img, pil_mask, result_rgb, result_arr
     gc.collect()
 
     if scale < 1.0:
